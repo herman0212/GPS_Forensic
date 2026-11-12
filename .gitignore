@@ -1,0 +1,32 @@
+﻿# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# VS Code
+.vscode/
+.idea/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Dataset
+data/Image2GPS25/images/
+data/Image2GPS25/metadata.csv
+
+# Experimental results
+outputs/
+
+# Temporary files
+*.log
+*.tmp
