@@ -67,3 +67,28 @@ def test_collect_features_preserves_csv_and_source_hash(tmp_path):
     assert result['exif']['timestamp'] == ''
     assert 'width' not in original
     assert sha256_file(path) == before
+
+
+def test_gps_forensics_report_json_and_pdf(tmp_path):
+    import json
+    rows = [dict(file='a.jpg',timestamp='2025-01-01T00:00:00',
+                 csv_original={'lat':'10','lon':'106'},exif={'latitude':10.001,'longitude':106}),
+            dict(file='b.jpg',timestamp='',exif={'latitude':0,'longitude':0}),
+            dict(file='c.jpg',timestamp='bad',csv_original={'lat':'91','lon':'0'},exif={}),
+            dict(file='d.jpg',timestamp='',exif={})]
+    report = build_report(rows,rule_options={'gps_tolerance_deg':0.0001})
+    assert report['gps']['valid'] == 2
+    assert report['gps']['missing'] == report['gps']['invalid'] == 1
+    assert report['gps']['csv_present'] == report['gps']['exif_present'] == 2
+    assert report['gps']['comparable'] == report['gps']['different'] == 1
+    text = json.dumps(report,ensure_ascii=False)
+    for removed in ('distance_limit','speed_limit','shared_clock','distance_km','speed_kmh','journey_group'):
+        assert removed not in text
+    assert 'gps_tolerance_deg' in text and 'gps_comparisons' in text
+    path = tmp_path/'gps.pdf'
+    export_pdf(report,path)
+    content = ' '.join(' '.join(p.extract_text() for p in PdfReader(path).pages).split())
+    assert 'độ tọa độ' in content and 'Minh chứng cảnh báo theo ảnh' in content
+    assert 'km/h' not in content and 'shared_clock' not in content
+    with pytest.raises(ValueError):
+        build_report(rows,rule_options={'distance_limit':500})

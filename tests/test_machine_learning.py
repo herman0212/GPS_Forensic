@@ -18,7 +18,7 @@ def sample_records(count=20):
 
 def test_features_exclude_names_labels_and_gps():
     records = sample_records()
-    records[0].update(label='Anomaly', latitude=181, speed_kmh=99999)
+    records[0].update(label='Anomaly', latitude=181, unrelated_numeric=99999)
     prepared = prepare_features(records)
     assert prepared['features'] == FEATURES
     assert prepared['matrix'].shape == (20, 4)

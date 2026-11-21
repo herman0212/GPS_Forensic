@@ -1,63 +1,81 @@
-"""Luật cảnh báo GPS/thời gian; cảnh báo không phải bằng chứng giả mạo."""
-import math
+"""GPS Forensics: dữ liệu thiếu, sai và bất nhất được báo riêng theo nguồn."""
 from collections import Counter
-from core.gps import valid_gps, haversine, compare_positions
-from core.timeline import parse_time, time_key
+from core.gps import gps_sources, compare_gps_sources, validate_tolerance
+from core.timeline import parse_time, time_key, missing_time
 
 
-def analyze_rules(records, distance_limit=500, speed_limit=900, gps_difference=0.1, shared_clock=False):
-    """Trả về cảnh báo và các cặp liên tiếp trong nhóm do người dùng xác nhận.
-
-    Không ghép các ảnh độc lập thành hành trình. Giờ aware và naive được giữ
-    riêng; GPS không hợp lệ không bị bỏ qua để nối hai đầu khoảng trống.
-    """
-    for value in (distance_limit, speed_limit, gps_difference):
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError('Ngưỡng cảnh báo phải là số hữu hạn lớn hơn 0.')
-    alerts, pairs = [], []
-
-    def add(record, kind, description, value='', level='Cảnh báo'):
-        alerts.append(dict(file=record['file'], kind=kind, description=description, value=value, level=level))
-
+def analyze_rules(records, gps_tolerance_deg=0.0001):
+    """Trả dict alerts, comparisons, gps_summary. Không thay đổi bản ghi gốc."""
+    tolerance = validate_tolerance(gps_tolerance_deg)
+    alerts, comparisons = [], []
+    summary = dict(valid=0, missing=0, invalid=0, csv_present=0, csv_valid=0,
+                   exif_present=0, exif_valid=0, comparable=0, different=0, insufficient=0)
     times = [parse_time(r.get('timestamp')) for r in records]
-    counts = Counter(time_key(t) for t in times if t)
-    offsets = {t.utcoffset() for t in times if t and t.tzinfo is not None}
-    mixed = any(t and t.tzinfo is None for t in times) and bool(offsets)
-    groups = {}
+    counts = Counter(time_key(t) for t in times if t is not None)
+    offsets = {t.utcoffset() for t in times if t is not None and t.tzinfo is not None}
+    mixed = bool(offsets) and any(t is not None and t.tzinfo is None for t in times)
+
+    def add(record, kind, description, value, level='Cảnh báo', source=''):
+        alerts.append(dict(file=record.get('file', ''), kind=kind, description=description,
+                           value=value, level=level, source=source))
+
     for record, stamp in zip(records, times):
-        raw = record.get('csv_original')
-        lat, lon = (raw.get('lat'), raw.get('lon')) if raw is not None else (record.get('latitude'), record.get('longitude'))
-        if lat is None or lon is None or str(lat).strip() == '' or str(lon).strip() == '':
-            add(record, 'gps_missing', 'Thiếu GPS')
-        elif not valid_gps(lat, lon):
-            add(record, 'gps_invalid', 'GPS không hợp lệ', f'{lat}, {lon}')
+        sources = gps_sources(record)
+        statuses = [s['status'] for s in sources.values()]
+        summary['valid'] += 'valid' in statuses
+        summary['missing'] += all(s == 'missing' for s in statuses)
+        summary['invalid'] += 'invalid' in statuses
+        for name in ('CSV', 'EXIF'):
+            summary[name.lower() + '_present'] += sources[name]['provided']
+            summary[name.lower() + '_valid'] += sources[name]['status'] == 'valid'
+        for name, gps in sources.items():
+            if name == 'reference' and not gps['provided']:
+                continue
+            evidence = dict(source=name, latitude=gps['raw_latitude'], longitude=gps['raw_longitude'])
+            if gps.get('raw_dms'):
+                evidence['raw_dms'] = gps['raw_dms']
+            if gps['status'] == 'missing':
+                add(record, 'gps_missing', f'GPS {name} thiếu hoặc chưa đủ hai thành phần; không suy đoán từ nguồn khác.',
+                    evidence, 'Thông tin' if 'valid' in statuses else 'Cảnh báo', name)
+            elif gps['status'] == 'invalid':
+                add(record, 'gps_invalid', f'GPS {name} không hợp lệ (phạm vi, kiểu dữ liệu hoặc số không hữu hạn).', evidence, source=name)
+        # Dùng raw_* để không làm mất trạng thái invalid đã phát hiện.
+        comparison = compare_gps_sources((sources['CSV']['raw_latitude'], sources['CSV']['raw_longitude']),
+                                         (sources['EXIF']['raw_latitude'], sources['EXIF']['raw_longitude']), tolerance)
+        row = dict(file=record.get('file', ''), timestamp=record.get('timestamp', ''),
+                   csv_latitude=sources['CSV']['raw_latitude'], csv_longitude=sources['CSV']['raw_longitude'],
+                   csv_status=sources['CSV']['status'], exif_latitude=sources['EXIF']['raw_latitude'],
+                   exif_longitude=sources['EXIF']['raw_longitude'], exif_status=sources['EXIF']['status'],
+                   reference_latitude=sources['reference']['raw_latitude'], reference_longitude=sources['reference']['raw_longitude'],
+                   reference_status=sources['reference']['status'], status=comparison['status'],
+                   latitude_delta_deg=comparison['latitude_delta_deg'], longitude_delta_deg=comparison['longitude_delta_deg'],
+                   gps_tolerance_deg=tolerance, reason=comparison['reason'])
+        comparisons.append(row)
+        summary['comparable'] += row['status'] != 'insufficient'
+        summary['different'] += row['status'] == 'difference'
+        summary['insufficient'] += row['status'] == 'insufficient'
+        if row['status'] == 'difference':
+            add(record, 'gps_source_difference', 'GPS EXIF và CSV lệch vượt ngưỡng độ tọa độ; không đủ để kết luận giả mạo.',
+                dict(latitude_delta_deg=row['latitude_delta_deg'], longitude_delta_deg=row['longitude_delta_deg'],
+                     gps_tolerance_deg=tolerance), source='CSV / EXIF')
         if stamp is None:
-            missing = not str(record.get('timestamp') or '').strip()
-            add(record, 'time_missing' if missing else 'time_invalid', 'Thiếu timestamp' if missing else 'Timestamp không hợp lệ', record.get('timestamp', ''))
+            missing = missing_time(record.get('timestamp'))
+            add(record, 'time_missing' if missing else 'time_invalid', 'Thiếu timestamp' if missing else 'Timestamp không hợp lệ',
+                record.get('timestamp', ''), source=record.get('timestamp_source', ''))
         else:
             if counts[time_key(stamp)] > 1:
-                add(record, 'time_duplicate', 'Timestamp trùng (không chứng minh cùng hành trình)', record['timestamp'])
+                add(record, 'time_duplicate', 'Timestamp trùng; không suy luận quan hệ giữa các ảnh.', record['timestamp'])
             if stamp.tzinfo is None:
-                add(record, 'timezone_unknown', 'Không biết múi giờ; không tự gán UTC', level='Thông tin')
-            if mixed or len(offsets) > 1:
-                add(record, 'timezone_difference', 'Tập dữ liệu có khác biệt thông tin múi giờ', level='Thông tin')
-            if record.get('journey_group'):
-                key = (record['journey_group'], time_key(stamp)[0])
-                groups.setdefault(key, []).append(record)
-        exif = record.get('exif', {})
-        if raw is not None and valid_gps(lat, lon) and valid_gps(exif.get('latitude'), exif.get('longitude')):
-            distance = haversine(lat, lon, exif['latitude'], exif['longitude'])
-            if distance > gps_difference:
-                add(record, 'gps_source_difference', 'GPS EXIF khác GPS CSV (km)', distance)
-    for (group, _), items in groups.items():
-        items = sorted(items, key=lambda r: time_key(parse_time(r['timestamp']))[1])
-        for first, second in zip(items, items[1:]):
-            result = compare_positions(first, second, shared_clock)
-            pairs.append(dict(first=first['file'], second=second['file'], group=group, **result))
-            if result['distance_km'] is not None and result['distance_km'] > distance_limit:
-                add(second, 'distance_large', f'Khoảng cách lớn từ {first["file"]} (km)', result['distance_km'])
-            if result['delta_seconds'] == 0:
-                add(second, 'time_zero', f'Khoảng thời gian bằng 0 với {first["file"]}', 0)
-            if result['speed_kmh'] is not None and result['speed_kmh'] > speed_limit:
-                add(second, 'speed_high', f'Vận tốc đường chim bay lớn từ {first["file"]} (km/h)', result['speed_kmh'], 'Cao')
-    return alerts, pairs
+                add(record, 'timezone_unknown', 'Timestamp chưa rõ múi giờ; không tự gán UTC hoặc GMT+7.', record['timestamp'], 'Thông tin')
+            csv_metadata = record.get('csv_original') or {}
+            exif_metadata = record.get('exif') or {}
+            csv_stamp = parse_time(csv_metadata.get('timestamp') or csv_metadata.get('timestamp_raw'))
+            exif_stamp = parse_time(exif_metadata.get('timestamp'))
+            source_difference = (csv_stamp is not None and exif_stamp is not None
+                                 and csv_stamp.utcoffset() != exif_stamp.utcoffset())
+            if mixed or len(offsets) > 1 or source_difference:
+                add(record, 'timezone_difference', 'Có khác biệt thông tin múi giờ trong tập hoặc giữa CSV và EXIF.',
+                    dict(timestamp=record['timestamp'], offset=str(stamp.utcoffset()) if stamp.tzinfo else None,
+                         csv_timestamp=csv_metadata.get('timestamp') or csv_metadata.get('timestamp_raw'),
+                         exif_timestamp=exif_metadata.get('timestamp')), 'Thông tin')
+    return dict(alerts=alerts, comparisons=comparisons, gps_summary=summary)

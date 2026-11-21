@@ -1,58 +1,87 @@
-"""Các giá trị Haversine có thể kiểm tra độc lập bằng kiến thức địa lý."""
+"""GPS Forensics: tính hợp lệ, DMS và đối chiếu theo độ tọa độ."""
+from copy import deepcopy
 import pytest
-from core.gps import haversine, compare_positions
+from core.gps import gps_decimal, valid_gps, normalize_gps, compare_gps_sources
 
 
-def record(name='a', lon=0, stamp='2025-01-01T00:00:00Z', group=''):
-    return dict(file=name, latitude=0, longitude=lon, timestamp=stamp, journey_group=group)
+def record(name='a', lon=0, stamp='2025-01-01T00:00:00Z'):
+    return dict(file=name, latitude=0, longitude=lon, timestamp=stamp,
+                timestamp_source='EXIF', exif={'latitude': 0, 'longitude': lon})
 
 
-def test_same_position():
-    assert haversine(10, 20, 10, 20) == 0
+@pytest.mark.parametrize('lat,lon', [(0,0),(-90,-180),(90,180),('10.25','106.5')])
+def test_valid_coordinates(lat, lon):
+    assert valid_gps(lat, lon)
 
 
-def test_known_distance():
-    # Một độ kinh tuyến tại xích đạo xấp xỉ 111,195 km.
-    assert haversine(0, 0, 0, 1) == pytest.approx(111.1949, abs=0.001)
-    # London đến New York khoảng 5570 km theo đường tròn lớn.
-    assert haversine(51.5074, -0.1278, 40.7128, -74.0060) == pytest.approx(5570.22, abs=1)
+@pytest.mark.parametrize('lat,lon', [(91,0),(0,181),(float('nan'),0),(0,float('inf')),
+                                     (None,0),('',0),('bad',0),(True,0),([],0),({},0)])
+def test_reject_invalid_or_missing(lat, lon):
+    assert not valid_gps(lat, lon)
 
 
-def test_antipodal_and_date_line():
-    assert haversine(0, 0, 0, 180) == pytest.approx(20015.087, abs=0.01)
-    assert haversine(0, 179, 0, -179) == pytest.approx(222.39, abs=0.01)
+@pytest.mark.parametrize('values,ref,expected', [((10,15,0),'N',10.25),((10,15,0),'S',-10.25),
+                                                ((106,30,0),'E',106.5),((180,0,0),'W',-180),((90,0,0),b'N',90)])
+def test_dms_valid(values, ref, expected):
+    assert gps_decimal(values, ref) == expected
 
 
-@pytest.mark.parametrize('coords', [(91, 0, 0, 0), (0, 181, 0, 0), (None, 0, 0, 0), (float('nan'), 0, 0, 0), (0, 0, float('inf'), 0)])
-def test_invalid_coordinates(coords):
+@pytest.mark.parametrize('values,ref', [(None,'N'),('123','N'),((1,2),'N'),((1,60,0),'N'),
+                                       ((1,0,60),'N'),((-1,0,0),'N'),((90,0,1),'N'),((181,0,0),'E'),
+                                       ((float('nan'),0,0),'N'),((1,0,float('inf')),'N'),((1,0,0),'X'),
+                                       ((True,0,0),'N'),((1,0,0),None)])
+def test_dms_invalid(values, ref):
+    assert gps_decimal(values, ref) is None
+
+
+def test_normalize_without_mutation():
+    values = [' 10.25 ', '106.5']
+    before = deepcopy(values)
+    result = normalize_gps(*values)
+    assert result['status'] == 'valid' and result['latitude'] == 10.25
+    assert result['raw_latitude'] == values[0] and values == before
+    assert normalize_gps(None, '')['status'] == 'missing'
+    assert normalize_gps('NaN', '')['status'] == 'invalid'
+
+
+@pytest.mark.parametrize('other,status', [((10,106),'match'),((10.00005,106.00005),'match'),
+                                         ((10.001,106),'difference'),((10,106.001),'difference'),
+                                         ((None,106),'insufficient'),((91,106),'insufficient')])
+def test_compare_sources(other, status):
+    result = compare_gps_sources({'lat':'10','lon':'106'}, other)
+    assert result['status'] == status
+    assert result['gps_tolerance_deg'] == 0.0001
+    if status == 'insufficient':
+        assert result['latitude_delta_deg'] is None
+        assert result['longitude_delta_deg'] is None
+
+
+def test_threshold_boundary_zero_and_no_coordinate_wrapping():
+    assert compare_gps_sources((0,0),(0.0001,0))['status'] == 'match'
+    assert compare_gps_sources((0,0),(0,0),0)['status'] == 'match'
+    assert compare_gps_sources((0,0),(1e-16,0),0)['status'] == 'difference'
+    assert compare_gps_sources((0,180),(0,-180))['longitude_delta_deg'] == 360
+
+
+@pytest.mark.parametrize('value', [-1,float('nan'),float('inf'),None,True,'bad'])
+def test_invalid_tolerance(value):
     with pytest.raises(ValueError):
-        haversine(*coords)
+        compare_gps_sources((0,0),(0,0),value)
 
 
-def test_distance_does_not_imply_journey():
-    result = compare_positions(record(), record('b', 1, '2025-01-01T01:00:00Z'))
-    assert result['distance_km'] > 100
-    assert result['speed_kmh'] is None
-    assert result['delta_seconds'] is None
-
-
-def test_speed_confirmed_group():
-    result = compare_positions(record(group='trip'), record('b', 1, '2025-01-01T08:00:00+07:00', 'trip'))
-    assert result['delta_seconds'] == 3600
-    assert result['speed_kmh'] == pytest.approx(111.1949, abs=0.001)
-
-
-def test_naive_clock_requires_confirmation():
-    a = record(stamp='2025-01-01T00:00:00', group='trip')
-    b = record('b', 1, '2025-01-01T01:00:00', 'trip')
-    assert compare_positions(a, b)['speed_kmh'] is None
-    assert compare_positions(a, b, True)['speed_kmh'] > 100
-
-
-@pytest.mark.parametrize('stamp', ['', 'bad', '2025-01-01T01:00:00', '2025-01-01T00:00:00Z', '2024-12-31T23:00:00Z'])
-def test_unusable_time_never_produces_speed(stamp):
-    assert compare_positions(record(group='trip'), record('b', 1, stamp, 'trip'), True)['speed_kmh'] is None
-
-
-def test_different_groups():
-    assert compare_positions(record(group='one'), record('b', 1, '2025-01-01T01:00:00Z', 'two'))['speed_kmh'] is None
+def test_exif_dms_parse_error_retains_evidence(tmp_path):
+    from PIL import Image
+    from core.metadata import read_exif
+    from core.anomaly import analyze_rules
+    from core.integrity import sha256_file
+    path = tmp_path / 'gps.jpg'
+    exif = Image.Exif()
+    exif[34853] = {1:'N',2:(10,0,61),3:'E',4:(106,0,0)}
+    Image.new('RGB',(10,10)).save(path,exif=exif)
+    before = sha256_file(path)
+    metadata = read_exif(path)
+    result = analyze_rules([dict(file=path.name,timestamp='',exif=metadata)])
+    assert metadata['gps_parse_invalid']
+    assert 'GPSLatitude' in metadata['gps_raw']
+    assert any(a['kind']=='gps_invalid' and a['source']=='EXIF' for a in result['alerts'])
+    assert sha256_file(path) == before

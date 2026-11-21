@@ -3,6 +3,11 @@ from collections import Counter
 from datetime import datetime, timezone
 
 
+def missing_time(value):
+    """Chỉ None và chuỗi rỗng là thiếu; số/bool sai kiểu không bị coi là thiếu."""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 def parse_time(value):
     """Đọc ISO 8601 hoặc EXIF; không cắt bỏ offset hay đoán múi giờ."""
     text = str(value or '').strip()
@@ -25,7 +30,7 @@ def time_key(stamp):
 
 
 def build_timeline(records, start='', end=''):
-    """Sắp xếp riêng hai nhóm; khoảng cách thời gian chỉ tính trong nhóm."""
+    """Sắp xếp riêng hai nhóm; chênh lệch thời gian chỉ tính trong nhóm."""
     lower, upper = parse_time(start), parse_time(end)
     if (start and lower is None) or (end and upper is None):
         raise ValueError('Bộ lọc cần thời gian ISO 8601 hợp lệ.')
@@ -40,7 +45,7 @@ def build_timeline(records, start='', end=''):
         row = dict(file=record['file'], timestamp=raw, source=record.get('timestamp_source', ''),
                    timezone='', delta_seconds='', status='', _stamp=stamp)
         if stamp is None:
-            row['status'] = 'Thiếu timestamp' if not str(raw or '').strip() else 'Timestamp không hợp lệ'
+            row['status'] = 'Thiếu timestamp' if missing_time(raw) else 'Timestamp không hợp lệ'
         else:
             group, normalized = time_key(stamp)
             row['timezone'] = str(stamp.utcoffset()) if stamp.tzinfo else 'Chưa rõ múi giờ'

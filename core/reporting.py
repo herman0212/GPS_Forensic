@@ -6,8 +6,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from xml.sax.saxutils import escape
 from core.anomaly import analyze_rules
-from core.gps import valid_gps
-from core.timeline import parse_time, time_key
+from core.gps import validate_tolerance
+from core.timeline import parse_time, time_key, missing_time
 
 PROJECT_TITLE = 'NGHIÊN CỨU KỸ THUẬT IMAGE FORENSICS VÀ XÂY DỰNG CHƯƠNG TRÌNH BẰNG PYTHON HỖ TRỢ PHÂN TÍCH ẢNH SỐ'
 LIMITATIONS = ('CSV không phải EXIF nhúng trong ảnh. Timestamp thiếu offset không được tự gán múi giờ. '
@@ -15,7 +15,9 @@ LIMITATIONS = ('CSV không phải EXIF nhúng trong ảnh. Timestamp thiếu off
                'JPEG MAE, dữ liệu sau EOI, GPS và Isolation Forest không đủ để kết luận giả mạo. '
                'Ngoại lệ thống kê khác với bất thường metadata và khác với ảnh bị chỉnh sửa. '
                'Không có nhãn ground truth giả mạo đáng tin cậy thì không tính Precision/Recall/F1 cho ảnh thật/giả. '
-               'Thực nghiệm tổng hợp chỉ kiểm tra phản ứng với can thiệp đã biết, không phải đánh giá độc lập.')
+               'Thực nghiệm tổng hợp chỉ kiểm tra phản ứng với can thiệp đã biết, không phải đánh giá độc lập. '
+               'Nếu GPS bị đổi thành tọa độ vẫn hợp lệ và không có nguồn tham chiếu đáng tin cậy, chương trình có thể không phát hiện. '
+               'Ngưỡng độ tọa độ chỉ để đối chiếu metadata, không phải tiêu chuẩn chứng minh giả mạo.')
 
 
 def protect_output(path, records=()):
@@ -35,7 +37,11 @@ def protect_output(path, records=()):
 def build_report(records, ml=None, dataset='Bộ ảnh đang phân tích', rule_options=None):
     """Chụp kết quả đã có, không tự điền kết quả JPEG/hash chưa đo."""
     records = deepcopy(records)
-    alerts, pairs = analyze_rules(records, **(rule_options or {}))
+    options = dict(rule_options or {})
+    if set(options) - {'gps_tolerance_deg'}:
+        raise ValueError('Cấu hình GPS Forensics chỉ nhận gps_tolerance_deg (độ tọa độ).')
+    options['gps_tolerance_deg'] = validate_tolerance(options.get('gps_tolerance_deg', 0.0001))
+    analysis = analyze_rules(records, **options)
     times = [parse_time(r.get('timestamp')) for r in records]
     time_counts = Counter(time_key(t) for t in times if t)
     measured_hashes = [r for r in records if r.get('sha256_before') and r.get('sha256_after')]
@@ -48,10 +54,10 @@ def build_report(records, ml=None, dataset='Bộ ảnh đang phân tích', rule_
                 dataset=dataset, total=len(records),
                 metadata=dict(csv=sum('csv_original' in r for r in records),
                               exif_present=sum(bool(r.get('exif', {}).get('tags')) for r in records)),
-                gps=dict(valid=sum(valid_gps(r.get('latitude'), r.get('longitude')) for r in records)),
+                gps=analysis['gps_summary'],
                 timeline=dict(valid=sum(t is not None for t in times),
-                              missing=sum(not str(r.get('timestamp') or '').strip() for r in records),
-                              invalid=sum(t is None and bool(str(r.get('timestamp') or '').strip()) for r, t in zip(records, times)),
+                              missing=sum(missing_time(r.get('timestamp')) for r in records),
+                              invalid=sum(t is None and not missing_time(r.get('timestamp')) for r, t in zip(records, times)),
                               unknown_timezone=sum(t is not None and t.tzinfo is None for t in times),
                               duplicate_records=sum(count for count in time_counts.values() if count > 1)),
                 integrity=dict(measured=len(measured_hashes), unchanged=sum(r.get('hash_unchanged') is True for r in measured_hashes),
@@ -61,7 +67,7 @@ def build_report(records, ml=None, dataset='Bộ ảnh đang phân tích', rule_
                           structure_measured=sum('jpeg_structure' in r for r in records),
                           structure_ok=sum(r.get('jpeg_structure', {}).get('structure_ok', False) for r in records),
                           trailing_data=sum(r.get('jpeg_structure', {}).get('trailing_bytes', 0) > 0 for r in records)),
-                alerts=alerts, pairs=pairs, rule_options=rule_options or {}, ml=deepcopy(ml),
+                alerts=analysis['alerts'], gps_comparisons=analysis['comparisons'], rule_options=options, ml=deepcopy(ml),
                 records=records, limitations=LIMITATIONS)
 
 
@@ -140,8 +146,13 @@ def export_pdf(report, path):
     text(report['dataset'])
     table([['Chỉ tiêu', 'Kết quả'], ['Tổng số ảnh', report['total']],
            ['Bản ghi nguồn CSV', report['metadata']['csv']], ['Ảnh có EXIF đọc được', report['metadata']['exif_present']],
-           ['GPS hợp lệ đang hiển thị', report['gps']['valid']]], [330, 150])
-    text('Dữ liệu gốc CSV được giữ trong csv_original; EXIF đọc từ ảnh nằm trong exif. Các thống kê, khoảng cách, MAE, hash và nhãn ML là kết quả tính toán riêng.')
+           ['Ảnh có ít nhất một nguồn GPS hợp lệ', report['gps']['valid']],
+           ['Ảnh không đủ GPS ở mọi nguồn', report['gps']['missing']],
+           ['Ảnh có ít nhất một nguồn GPS không hợp lệ', report['gps']['invalid']],
+           ['Bản ghi có dữ liệu GPS CSV / EXIF', f'{report["gps"]["csv_present"]} / {report["gps"]["exif_present"]}'],
+           ['Cặp GPS CSV / EXIF hợp lệ có thể đối chiếu', report['gps']['comparable']],
+           ['Khác biệt vượt ngưỡng / không đủ dữ liệu', f'{report["gps"]["different"]} / {report["gps"]["insufficient"]}']], [330, 150])
+    text('CSV gốc được giữ trong csv_original; EXIF đọc trực tiếp từ ảnh nằm trong exif. Các thống kê, sai lệch từng thành phần tọa độ, MAE, hash và nhãn ML là kết quả tính toán riêng. Các nhóm thống kê GPS có thể giao nhau nếu một nguồn hợp lệ và nguồn khác sai.')
     section('2. Timeline')
     table([['Chỉ tiêu', 'Số ảnh']] + [[label, report['timeline'][key]] for label, key in
            [('Timestamp hợp lệ', 'valid'), ('Thiếu timestamp', 'missing'), ('Timestamp sai', 'invalid'),
@@ -159,10 +170,15 @@ def export_pdf(report, path):
     story.append(bar_chart(['Giữ hash', 'Đổi hash', 'Chưa đo'], [integrity['unchanged'], integrity['changed'], integrity['not_measured']], 'Trạng thái đối chiếu hash'))
     section('4. Cảnh báo theo quy tắc')
     counts = Counter(a['kind'] for a in report['alerts'])
-    text(f'{len(report["alerts"])} cảnh báo/thông tin; {len(report["pairs"])} cặp trong nhóm hành trình đã xác nhận.')
-    text('Cấu hình luật: ' + json.dumps(report['rule_options'] or {'distance_limit': 500, 'speed_limit': 900, 'gps_difference': 0.1, 'shared_clock': False}, ensure_ascii=False))
+    text(f'{len(report["alerts"])} cảnh báo/thông tin. Đối chiếu riêng vĩ độ và kinh độ giữa CSV và EXIF.')
+    text('Cấu hình luật (độ tọa độ): ' + json.dumps(report['rule_options'], ensure_ascii=False))
     if counts:
         table([['Loại', 'Số lượng']] + list(counts.items()), [330, 150])
+    if report['alerts']:
+        section('Minh chứng cảnh báo theo ảnh')
+        table([['Ảnh / nguồn', 'Loại / mô tả', 'Giá trị / mức']] + [
+            [f'{a["file"]} / {a.get("source", "")}', f'{a["kind"]}: {a["description"]}',
+             f'{json.dumps(a["value"], ensure_ascii=False)} / {a["level"]}'] for a in report['alerts']], [140, 220, 120])
     story.append(PageBreak())
     section('5. Isolation Forest - ngoại lệ thống kê')
     ml = report['ml']

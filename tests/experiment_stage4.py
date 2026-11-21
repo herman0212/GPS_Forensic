@@ -87,7 +87,7 @@ def main():
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8')
     root = Path.cwd()
-    output = root / 'outputs/stage4'
+    output = root / 'outputs/gps_forensics/experiment'
     output.mkdir(parents=True, exist_ok=True)
     protected = sorted(p for p in (root / 'data').rglob('*') if p.is_file())
     protected += sorted((root / 'outputs').glob('stage3_*'))

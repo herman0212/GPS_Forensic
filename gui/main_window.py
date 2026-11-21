@@ -3,13 +3,15 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QPixmap, QFont, QFontDatabase
 from PySide6.QtWidgets import (QFileDialog, QMessageBox, QPushButton, QLabel, QLineEdit,
                               QTableWidget, QTableWidgetItem, QDialog, QVBoxLayout,
-                              QHBoxLayout, QTabWidget, QDoubleSpinBox, QCheckBox, QWidget, QApplication)
+                              QHBoxLayout, QTabWidget, QDoubleSpinBox, QWidget, QApplication)
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from core.legacy import Window as LegacyWindow
 from core.metadata import load_dataset, export_rows
+from core.reporting import protect_output
+import json
 from core.timeline import build_timeline
-from core.gps import compare_positions
+from core.gps import validate_tolerance
 from core.anomaly import analyze_rules
 from core.map_view import export_map
 from gui.forensics_tabs import ForensicsTabs
@@ -48,7 +50,7 @@ class Window(LegacyWindow):
         self.timeline_table = QTableWidget()
         layout.addWidget(self.timeline_table)
         self.timeline_rows = []
-        button = QPushButton('GPS / Khoảng cách / Bản đồ / Cảnh báo')
+        button = QPushButton('GPS Forensics Investigation')
         button.clicked.connect(self.open_gps_analysis)
         layout.itemAt(0).layout().addWidget(button)
         # Chia thanh nút thành hai hàng để không ép cửa sổ rộng hơn màn hình.
@@ -203,110 +205,67 @@ class Window(LegacyWindow):
         self.stage4.run_ml()
 
     def open_gps_analysis(self):
-        """Mở bảng chọn nhóm hành trình, ngưỡng cảnh báo và bản đồ nhúng."""
+        """Điều tra nguồn GPS, giữ ảnh và metadata gốc ở cửa sổ chính."""
         if self.gps_dialog is None:
             self.gps_dialog = QDialog(self)
-            self.gps_dialog.setWindowTitle('Phân tích GPS và thời gian — Giai đoạn 2')
-            self.gps_dialog.resize(1150, 800)
+            self.gps_dialog.setWindowTitle('GPS Forensics Investigation')
+            self.gps_dialog.resize(1180, 800)
             layout = QVBoxLayout(self.gps_dialog)
-            note = QLabel('Chỉ gán cùng nhóm khi đã xác nhận cùng hành trình. Cảnh báo không kết luận ảnh giả mạo.')
+            note = QLabel('Đối chiếu GPS CSV và EXIF bằng độ tọa độ. Thiếu nguồn không có nghĩa hai nguồn giống nhau. Cảnh báo không chứng minh giả mạo.')
             note.setWordWrap(True)
             layout.addWidget(note)
             controls = QHBoxLayout()
-            self.journey_name = QLineEdit()
-            self.journey_name.setPlaceholderText('Tên nhóm hành trình đã xác nhận')
-            controls.addWidget(self.journey_name)
-            for text, action in [('Gán nhóm cho ảnh chọn', self.assign_journey),
-                                 ('Bỏ nhóm ảnh chọn', self.clear_journey),
-                                 ('So sánh 2 ảnh chọn', self.compare_selected)]:
-                button = QPushButton(text)
+            controls.addWidget(QLabel('Ngưỡng sai lệch GPS (độ tọa độ):'))
+            self.gps_tolerance_deg = QDoubleSpinBox()
+            self.gps_tolerance_deg.setDecimals(8)
+            self.gps_tolerance_deg.setRange(0, 360)
+            self.gps_tolerance_deg.setSingleStep(0.0001)
+            self.gps_tolerance_deg.setValue(0.0001)
+            controls.addWidget(self.gps_tolerance_deg)
+            for title, action in [('Cập nhật phân tích', self.refresh_gps_analysis),
+                                  ('Xuất đối chiếu CSV', self.export_gps_csv),
+                                  ('Xuất điều tra JSON', self.export_gps_json),
+                                  ('Xuất bản đồ HTML', self.map_export)]:
+                button = QPushButton(title)
                 button.clicked.connect(action)
                 controls.addWidget(button)
             layout.addLayout(controls)
-            self.shared_clock = QCheckBox('Tôi xác nhận giờ không offset trong các nhóm dùng cùng cơ sở đồng hồ')
-            layout.addWidget(self.shared_clock)
-            thresholds = QHBoxLayout()
-            self.distance_limit = self.threshold(thresholds, 'Khoảng cách (km)', 500)
-            self.speed_limit = self.threshold(thresholds, 'Vận tốc (km/h)', 900)
-            self.gps_difference = self.threshold(thresholds, 'Sai khác CSV/EXIF (km)', 0.1)
-            button = QPushButton('Phân tích lại / cập nhật bản đồ')
-            button.clicked.connect(self.refresh_gps_analysis)
-            thresholds.addWidget(button)
-            layout.addLayout(thresholds)
-            self.comparison = QLabel('Chọn đúng 2 dòng trong tab Ảnh để so sánh.')
-            self.comparison.setWordWrap(True)
-            layout.addWidget(self.comparison)
+            self.gps_summary = QLabel('Chưa phân tích.')
+            self.gps_summary.setWordWrap(True)
+            layout.addWidget(self.gps_summary)
             self.gps_tabs = QTabWidget()
             layout.addWidget(self.gps_tabs)
-            self.journey_table = QTableWidget()
-            self.journey_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-            self.journey_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
-            self.gps_tabs.addTab(self.journey_table, 'Ảnh / Nhóm xác nhận')
-            self.pairs_table = QTableWidget()
-            self.gps_tabs.addTab(self.pairs_table, 'Khoảng cách / Vận tốc')
+            self.gps_image_table = QTableWidget()
+            self.gps_image_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+            self.gps_tabs.addTab(self.gps_image_table, 'Ảnh và Metadata')
+            self.source_table = QTableWidget()
+            self.gps_tabs.addTab(self.source_table, 'GPS EXIF / CSV')
             self.alert_table = QTableWidget()
-            self.gps_tabs.addTab(self.alert_table, 'Cảnh báo')
-            # QWebEngineView là thành phần của PySide6, chỉ nạp khi mở bản đồ.
+            self.gps_tabs.addTab(self.alert_table, 'Cảnh báo GPS và thời gian')
+            self.gps_image_table.itemSelectionChanged.connect(self.select_gps_image)
             try:
                 from PySide6.QtWebEngineWidgets import QWebEngineView
                 from PySide6.QtWebEngineCore import QWebEngineSettings
                 self.map_widget = QWebEngineView()
-                self.map_widget.settings().setAttribute(
-                    QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+                self.map_widget.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
                 self.gps_tabs.addTab(self.map_widget, 'GPS Map')
             except ImportError:
                 self.map_widget = None
-                self.gps_tabs.addTab(QLabel('Thiếu QtWebEngineWidgets. Cài PySide6 đầy đủ; vẫn có thể xuất HTML.'), 'GPS Map')
-            self.map_status = QLabel('Bản đồ nền và thư viện Folium cần kết nối Internet.')
+                self.gps_tabs.addTab(QLabel('Thiếu QtWebEngineWidgets. Vẫn có thể xuất HTML.'), 'GPS Map')
+            self.map_status = QLabel('Bản đồ và thư viện Folium cần Internet; CSV màu xanh dương, EXIF xanh lá, nguồn chưa rõ màu xám.')
+            self.map_status.setWordWrap(True)
             layout.addWidget(self.map_status)
             if self.map_widget is not None:
                 self.map_widget.loadFinished.connect(self.map_load_finished)
-            self.refresh_gps_analysis()
+        self.refresh_gps_analysis()
         self.gps_dialog.show()
         self.gps_dialog.raise_()
 
-    def threshold(self, layout, label, value):
-        """Tạo ô ngưỡng dương để tránh tham số không có ý nghĩa."""
-        layout.addWidget(QLabel(label))
-        spin = QDoubleSpinBox()
-        spin.setDecimals(3)
-        spin.setRange(0.001, 1000000)
-        spin.setValue(value)
-        layout.addWidget(spin)
-        return spin
-
-    def selected_gps_rows(self):
-        return sorted({item.row() for item in self.journey_table.selectedItems()})
-
-    def assign_journey(self):
-        name = self.journey_name.text().strip()
-        rows = self.selected_gps_rows()
-        if not name or not rows:
-            QMessageBox.information(self, 'Chọn nhóm', 'Nhập tên nhóm và chọn các dòng ảnh đã xác nhận cùng hành trình.')
-            return
-        for index in rows:
-            self.records[index]['journey_group'] = name
-        self.refresh_gps_analysis()
-
-    def clear_journey(self):
-        for index in self.selected_gps_rows():
-            self.records[index].pop('journey_group', None)
-        self.refresh_gps_analysis()
-
-    def compare_selected(self):
-        rows = self.selected_gps_rows()
-        if len(rows) != 2:
-            self.comparison.setText('Cần chọn đúng 2 ảnh (giữ Ctrl để chọn nhiều dòng).')
-            return
-        first, second = [self.records[i] for i in rows]
-        from core.timeline import parse_time
-        a, b = parse_time(first.get('timestamp')), parse_time(second.get('timestamp'))
-        if a and b and (a.tzinfo is None) == (b.tzinfo is None) and a > b:
-            first, second = second, first
-        result = compare_positions(first, second, self.shared_clock.isChecked())
-        distance = 'không tính' if result['distance_km'] is None else f'{result["distance_km"]:.3f} km'
-        speed = 'không tính' if result['speed_kmh'] is None else f'{result["speed_kmh"]:.3f} km/h'
-        self.comparison.setText(f'{first["file"]} → {second["file"]}: {distance}; vận tốc: {speed}. {result["reason"]}')
+    def select_gps_image(self):
+        index = self.gps_image_table.currentRow()
+        if 0 <= index < len(self.records):
+            self.table.selectRow(index)
+            self.show_details()
 
     def fill_analysis_table(self, table, rows, keys, labels):
         table.setColumnCount(len(keys))
@@ -315,40 +274,78 @@ class Window(LegacyWindow):
         for i, row in enumerate(rows):
             for j, key in enumerate(keys):
                 value = row.get(key)
+                if isinstance(value, (dict, list)):
+                    value = json.dumps(value, ensure_ascii=False, default=str)
+                if key in ('csv_status', 'exif_status', 'reference_status', 'status'):
+                    labels = {'valid': 'Hợp lệ', 'missing': 'Thiếu dữ liệu', 'invalid': 'Không hợp lệ',
+                              'match': 'Khớp trong ngưỡng', 'difference': 'Khác vượt ngưỡng', 'insufficient': 'Chưa đủ dữ liệu'}
+                    value = labels.get(value, value)
                 item = QTableWidgetItem('' if value is None else str(value))
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 table.setItem(i, j, item)
         table.resizeColumnsToContents()
 
     def refresh_gps_analysis(self):
-        """Chỉ xuất kết quả suy luận riêng, không sửa CSV/EXIF gốc."""
-        alerts, pairs = analyze_rules(self.records, self.distance_limit.value(), self.speed_limit.value(),
-                                     self.gps_difference.value(), self.shared_clock.isChecked())
-        self.fill_analysis_table(self.journey_table, self.records,
-                                 ['file', 'timestamp', 'latitude', 'longitude', 'journey_group'],
-                                 ['Ảnh', 'Timestamp', 'Vĩ độ', 'Kinh độ', 'Nhóm do người dùng xác nhận'])
-        self.fill_analysis_table(self.pairs_table, pairs,
-                                 ['first', 'second', 'group', 'distance_km', 'delta_seconds', 'speed_kmh', 'reason'],
-                                 ['Ảnh trước', 'Ảnh sau', 'Nhóm', 'Khoảng cách km', 'Giây', 'km/h', 'Lý do không tính'])
-        self.fill_analysis_table(self.alert_table, alerts, ['file', 'kind', 'description', 'value', 'level'],
-                                 ['Ảnh', 'Loại', 'Mô tả', 'Giá trị', 'Mức cảnh báo'])
-        self.comparison.setText(f'{len(alerts)} cảnh báo/thông tin; {len(pairs)} cặp trong nhóm xác nhận. Không kết luận giả mạo.')
+        """Mỗi bảng là kết quả mới, không sửa CSV hoặc EXIF gốc."""
+        tolerance = validate_tolerance(self.gps_tolerance_deg.value())
+        self.gps_analysis = analyze_rules(self.records, gps_tolerance_deg=tolerance)
+        self.fill_analysis_table(self.gps_image_table, self.records,
+                                 ['file', 'timestamp', 'timestamp_source', 'camera', 'format'],
+                                 ['Ảnh', 'Timestamp', 'Nguồn thời gian', 'Camera', 'Định dạng'])
+        self.fill_analysis_table(self.source_table, self.gps_analysis['comparisons'],
+                                 ['file', 'csv_latitude', 'csv_longitude', 'csv_status', 'exif_latitude', 'exif_longitude',
+                                  'exif_status', 'latitude_delta_deg', 'longitude_delta_deg', 'status', 'reason'],
+                                 ['Ảnh', 'Vĩ độ CSV', 'Kinh độ CSV', 'CSV', 'Vĩ độ EXIF', 'Kinh độ EXIF',
+                                  'EXIF', 'Lệch vĩ độ (độ)', 'Lệch kinh độ (độ)', 'Kết quả', 'Diễn giải'])
+        self.fill_analysis_table(self.alert_table, self.gps_analysis['alerts'],
+                                 ['file', 'source', 'kind', 'description', 'value', 'level'],
+                                 ['Ảnh', 'Nguồn', 'Loại', 'Mô tả', 'Minh chứng', 'Mức'])
+        stats = self.gps_analysis['gps_summary']
+        self.gps_summary.setText(f'{len(self.records)} ảnh | GPS hợp lệ: {stats["valid"]} | Thiếu mọi nguồn: {stats["missing"]} | Có nguồn sai: {stats["invalid"]}\n'
+                                 f'Đối chiếu được: {stats["comparable"]} | Khác vượt ngưỡng: {stats["different"]} | Chưa đủ dữ liệu: {stats["insufficient"]}. Không kết luận thật/giả.')
         path = Path(self.map_directory.name) / 'map.html'
         try:
             export_map(self.records, path)
             if self.map_widget is not None:
                 self.map_widget.load(QUrl.fromLocalFile(str(path.resolve())))
-        except OSError as error:
+        except (OSError, ValueError) as error:
             self.map_status.setText(f'Không tạo được bản đồ: {error}')
+        if hasattr(self, 'stage4'):
+            self.stage4.refresh()
+
+    def export_gps_csv(self):
+        if not self.records:
+            QMessageBox.information(self, 'Chưa có dữ liệu', 'Hãy nhập CSV hoặc chọn ảnh trước.')
+            return
+        self.refresh_gps_analysis()
+        path, _ = QFileDialog.getSaveFileName(self, 'Xuất đối chiếu GPS', 'outputs/gps_forensics/comparisons.csv', 'CSV (*.csv)')
+        if path:
+            try:
+                export_rows(self.gps_analysis['comparisons'], protect_output(path, self.records))
+            except (OSError, ValueError) as error:
+                QMessageBox.warning(self, 'Lỗi xuất GPS', str(error))
+
+    def export_gps_json(self):
+        if not self.records:
+            QMessageBox.information(self, 'Chưa có dữ liệu', 'Hãy nhập CSV hoặc chọn ảnh trước.')
+            return
+        self.refresh_gps_analysis()
+        path, _ = QFileDialog.getSaveFileName(self, 'Xuất điều tra GPS', 'outputs/gps_forensics/investigation.json', 'JSON (*.json)')
+        if path:
+            try:
+                result = dict(gps_tolerance_deg=self.gps_tolerance_deg.value(), **self.gps_analysis)
+                protect_output(path, self.records).write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding='utf-8')
+            except (OSError, ValueError) as error:
+                QMessageBox.warning(self, 'Lỗi xuất GPS', str(error))
 
     def map_load_finished(self, success):
         self.map_status.setText('HTML đã nạp; bản đồ nền và thư viện cần Internet.' if success
-                                else 'Không nạp được HTML bản đồ. Có thể dùng nút xuất HTML để thử lại.')
+                                else 'Không nạp được HTML. Vẫn có thể xuất HTML để kiểm tra.')
 
     def map_export(self):
-        path, _ = QFileDialog.getSaveFileName(self, 'Xuất bản đồ', 'outputs/map.html', 'HTML (*.html)')
+        path, _ = QFileDialog.getSaveFileName(self, 'Xuất bản đồ', 'outputs/gps_forensics/map.html', 'HTML (*.html)')
         if path:
             try:
-                export_map(self.records, path)
-            except OSError as error:
+                export_map(self.records, protect_output(path, self.records))
+            except (OSError, ValueError) as error:
                 QMessageBox.warning(self, 'Lỗi xuất bản đồ', str(error))

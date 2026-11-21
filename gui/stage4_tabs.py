@@ -97,8 +97,8 @@ class Stage4Tabs(QObject):
         overview.addStretch()
         self.map_layout = QVBoxLayout(self.map_page)
         self.button(self.map_layout, 'Cập nhật bản đồ', self.update_map)
-        self.button(self.map_layout, 'Nhóm hành trình / cấu hình GPS và thời gian', self.window.open_gps_analysis)
-        self.map_status = QLabel('Bản đồ cần Internet cho Leaflet và bản đồ nền. Không tự nối hành trình.')
+        self.button(self.map_layout, 'GPS Forensics Investigation / cấu hình đối chiếu', self.window.open_gps_analysis)
+        self.map_status = QLabel('Bản đồ cần Internet cho Leaflet và bản đồ nền. Marker tách riêng nguồn CSV và EXIF.')
         self.map_status.setWordWrap(True)
         self.map_layout.addWidget(self.map_status)
         layout = QVBoxLayout(self.anomaly_page)
@@ -118,7 +118,7 @@ class Stage4Tabs(QObject):
         ml_layout.addLayout(controls)
         self.progress = QProgressBar()
         ml_layout.addWidget(self.progress)
-        self.ml_status = QLabel('Chưa chạy ML. Đặc trưng ảnh: dung lượng, chiều rộng, chiều cao, JPEG MAE. Không dùng GPS/thời gian/vận tốc.')
+        self.ml_status = QLabel('Chưa chạy ML. Đặc trưng ảnh: dung lượng, chiều rộng, chiều cao, JPEG MAE. Chỉ dùng đặc trưng ảnh, không dùng GPS/thời gian.')
         self.ml_status.setWordWrap(True)
         ml_layout.addWidget(self.ml_status)
         self.ml_table = QTableWidget()
@@ -128,7 +128,7 @@ class Stage4Tabs(QObject):
         self.anomaly_tabs.addTab(ml_page, 'Machine Learning / Phát hiện ngoại lệ')
         rules = QWidget()
         rule_layout = QVBoxLayout(rules)
-        self.button(rule_layout, 'Cập nhật luật / nhóm hành trình', self.window.open_gps_analysis)
+        self.button(rule_layout, 'GPS Forensics / cấu hình luật', self.window.open_gps_analysis)
         self.rule_table = QTableWidget()
         rule_layout.addWidget(self.rule_table)
         self.anomaly_tabs.addTab(rules, 'Cảnh báo theo quy tắc')
@@ -146,8 +146,7 @@ class Stage4Tabs(QObject):
         w = self.window
         if w.gps_dialog is None:
             return {}
-        return dict(distance_limit=w.distance_limit.value(), speed_limit=w.speed_limit.value(),
-                    gps_difference=w.gps_difference.value(), shared_clock=w.shared_clock.isChecked())
+        return dict(gps_tolerance_deg=w.gps_tolerance_deg.value())
 
     def refresh(self):
         current = dataset_signature(self.window.records)
@@ -160,13 +159,13 @@ class Stage4Tabs(QObject):
         self.overview_text.setText(f'Tổng {report["total"]} ảnh | CSV: {report["metadata"]["csv"]} | EXIF: {report["metadata"]["exif_present"]}\n'
                                   f'GPS hợp lệ: {report["gps"]["valid"]} | Timestamp hợp lệ: {report["timeline"]["valid"]} | Chưa rõ múi giờ: {report["timeline"]["unknown_timezone"]}\n'
                                   'Bất thường metadata, ngoại lệ thống kê và giả mạo là ba khái niệm khác nhau.')
-        self.fill_table(self.rule_table, report['alerts'], ['file', 'kind', 'description', 'value', 'level'])
+        self.fill_table(self.rule_table, report['alerts'], ['file', 'source', 'kind', 'description', 'value', 'level'])
         if self.web_map is not None:
             self.update_map()
 
     def fill_table(self, table, rows, keys):
         table.setColumnCount(len(keys))
-        labels = {'file': 'Ảnh', 'label': 'Nhãn', 'imputed_features': 'Đặc trưng điền trung vị',
+        labels = {'file': 'Ảnh', 'source': 'Nguồn', 'label': 'Nhãn', 'imputed_features': 'Đặc trưng điền trung vị',
                   'reason': 'Lý do', 'kind': 'Loại', 'description': 'Mô tả', 'value': 'Giá trị',
                   'level': 'Mức', 'file_bytes': 'Dung lượng byte', 'width': 'Chiều rộng', 'height': 'Chiều cao'}
         table.setHorizontalHeaderLabels([labels.get(key, key) for key in keys])
@@ -252,7 +251,7 @@ class Stage4Tabs(QObject):
         if not self.window.records:
             self.report_status.setText('Chưa có dữ liệu để báo cáo.')
             return
-        path, _ = QFileDialog.getSaveFileName(self.window, 'Xuất PDF', 'outputs/stage4/report.pdf', 'PDF (*.pdf)')
+        path, _ = QFileDialog.getSaveFileName(self.window, 'Xuất PDF', 'outputs/gps_forensics/report.pdf', 'PDF (*.pdf)')
         if path:
             self.start_worker('pdf', dict(report=self.snapshot(), path=path))
 
@@ -261,7 +260,7 @@ class Stage4Tabs(QObject):
         if self.ml_result is None:
             self.ml_status.setText('Hãy chạy ML trước khi xuất CSV.')
             return
-        path, _ = QFileDialog.getSaveFileName(self.window, 'Xuất ML', 'outputs/stage4/ml_results.csv', 'CSV (*.csv)')
+        path, _ = QFileDialog.getSaveFileName(self.window, 'Xuất ML', 'outputs/gps_forensics/ml_results.csv', 'CSV (*.csv)')
         if path:
             try:
                 export_rows(self.ml_result['results'], protect_output(path, self.window.records))
@@ -272,7 +271,7 @@ class Stage4Tabs(QObject):
         if not self.window.records:
             self.report_status.setText('Chưa có dữ liệu để báo cáo.')
             return
-        path, _ = QFileDialog.getSaveFileName(self.window, 'Xuất snapshot', 'outputs/stage4/report_snapshot.json', 'JSON (*.json)')
+        path, _ = QFileDialog.getSaveFileName(self.window, 'Xuất snapshot', 'outputs/gps_forensics/report_snapshot.json', 'JSON (*.json)')
         if path:
             try:
                 target = protect_output(path, self.window.records)
@@ -288,9 +287,17 @@ class Stage4Tabs(QObject):
                 self.web_map = QWebEngineView()
                 self.web_map.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
                 self.map_layout.addWidget(self.web_map)
+                self.web_map.loadFinished.connect(self.on_map_loaded)
             except ImportError:
                 self.map_status.setText('Thiếu QtWebEngineWidgets. Có thể dùng chức năng xuất bản đồ HTML.')
                 return
         path = Path(self.window.map_directory.name) / 'stage4_map.html'
-        export_map(self.window.records, path)
-        self.web_map.load(QUrl.fromLocalFile(str(path.resolve())))
+        try:
+            export_map(self.window.records, path)
+            self.web_map.load(QUrl.fromLocalFile(str(path.resolve())))
+        except (OSError, ValueError) as error:
+            self.map_status.setText(f'Không tạo được bản đồ: {error}')
+
+    def on_map_loaded(self, success):
+        self.map_status.setText('HTML đã nạp; nguồn CSV xanh dương, EXIF xanh lá. Bản đồ nền cần Internet.' if success
+                                else 'Không nạp được bản đồ. Có thể xuất HTML để kiểm tra; không bỏ qua lỗi mạng.')

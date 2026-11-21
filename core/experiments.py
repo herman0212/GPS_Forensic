@@ -32,9 +32,9 @@ def controlled_experiment(records, contamination=0.1):
         metadata[0]['csv_original']['lat'] = '181'
     metadata[1]['timestamp'] = 'not-a-timestamp'
     metadata[2]['timestamp'] = ''
-    alerts, _ = analyze_rules(metadata)
+    alerts = analyze_rules(metadata)['alerts']
     bad_kinds = {'gps_invalid', 'gps_missing', 'time_invalid', 'time_missing'}
-    detected = {a['file'] for a in alerts if a['kind'] in bad_kinds}
+    detected = {a['file'] for a in alerts if a['kind'] in bad_kinds and a['level'] != 'Thông tin'}
     metadata_metrics = evaluate_labels([int(i < 3) for i in range(len(records))],
                                        [int(r['file'] in detected) for r in metadata])
     return dict(scope='Nhãn can thiệp tổng hợp, KHÔNG phải nhãn ảnh thật/giả mạo. Không phải đánh giá độc lập.',

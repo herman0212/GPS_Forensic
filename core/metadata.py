@@ -28,8 +28,11 @@ def read_exif(path):
         from core.gps import gps_decimal
         lat = gps_decimal(gps.get(2), gps.get(1)) if gps else None
         lon = gps_decimal(gps.get(4), gps.get(3)) if gps else None
-        if gps.get(1) not in ('N', 'S') or gps.get(3) not in ('E', 'W'):
-            lat = lon = None
+        if gps.get(1) not in ('N', 'S', b'N', b'S'):
+            lat = None
+        if gps.get(3) not in ('E', 'W', b'E', b'W'):
+            lon = None
+        gps_parse_invalid = (2 in gps and lat is None) or (4 in gps and lon is None)
         stamp = tags.get(36867) or tags.get(36868) or tags.get(306) or ''
         offset = tags.get(36881) or tags.get(36880) or ''
         if stamp and offset:
@@ -45,7 +48,9 @@ def read_exif(path):
                 'longitude': lon, 'camera': str(tags.get(272, '')),
                 'altitude': altitude, 'format': image.format,
                 'size': f'{image.width}x{image.height}',
-                'tags': {str(ExifTags.TAGS.get(k, k)): str(v) for k, v in tags.items()}}
+                'tags': {str(ExifTags.TAGS.get(k, k)): str(v) for k, v in tags.items()},
+                'gps_raw': {str(ExifTags.GPSTAGS.get(k, k)): str(v) for k, v in gps.items()},
+                'gps_parse_invalid': gps_parse_invalid}
 
 
 def load_dataset(csv_path):

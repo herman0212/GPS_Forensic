@@ -1,4 +1,4 @@
-﻿"""Geo Image Forensics Analyzer — educational prototype.
+"""Geo Image Forensics Analyzer — educational prototype.
 Run: pip install -r requirements.txt && python main.py
 Optional: install ExifTool and add it to PATH for robust EXIF/GPS parsing.
 """
@@ -6,7 +6,6 @@ import csv
 import hashlib
 import io
 import json
-import math
 import shutil
 import subprocess
 import sys
@@ -41,14 +40,9 @@ def rational(x):
         return None
 
 def gps_decimal(dms, ref):
-    try:
-        v = [rational(x) for x in dms]
-        if any(x is None for x in v):
-            return None
-        n = v[0] + v[1]/60 + v[2]/3600
-        return -n if str(ref).upper() in ('S', 'W') else n
-    except (ValueError, TypeError, IndexError):
-        return None
+    from core.gps import gps_decimal as decode_gps
+    return decode_gps(dms, ref)
+
 
 def exiftool_data(path):
     if not shutil.which('exiftool'):
@@ -81,17 +75,9 @@ def analyze(records):
     return records
 
 def export_map(records, output):
-    import folium
-    valid = [r for r in records if r['latitude'] is not None and r['longitude'] is not None]
-    if not valid:
-        raise ValueError('Không có ảnh chứa tọa độ GPS hợp lệ')
-    center = [sum(r['latitude'] for r in valid)/len(valid),
-              sum(r['longitude'] for r in valid)/len(valid)]
-    m = folium.Map(location=center, zoom_start=10)
-    for r in valid:
-        label = f"{r['file']} | {r['timestamp'] or 'Không rõ thời gian'}"
-        folium.Marker([r['latitude'], r['longitude']], tooltip=label).add_to(m)
-    m.save(str(output))
+    from core.map_view import export_map as save_gps_map
+    return save_gps_map(records, output)
+
 
 class Window(QMainWindow):
     def __init__(self):
@@ -210,5 +196,3 @@ if __name__ == '__main__':
     w = Window()
     w.show()
     sys.exit(app.exec())
-
-

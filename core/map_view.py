@@ -1,20 +1,26 @@
-"""Tạo bản đồ bằng Folium, không viết JavaScript thủ công."""
+"""Marker GPS tách theo nguồn, Folium tự sinh HTML/JavaScript."""
 from html import escape
 import folium
-from core.gps import valid_gps
+from core.gps import gps_sources
 
 
 def create_map(records):
-    """Chỉ tạo marker GPS hợp lệ; không mặc định nối thành hành trình."""
-    valid = [r for r in records if valid_gps(r.get('latitude'), r.get('longitude'))]
+    """Mỗi nguồn hợp lệ có marker riêng; không suy diễn quan hệ giữa các ảnh."""
     result = folium.Map(location=[0, 0], zoom_start=2)
     points = []
-    for record in valid:
-        point = [float(record['latitude']), float(record['longitude'])]
-        points.append(point)
-        source = 'CSV' if 'csv_original' in record else 'EXIF'
-        text = escape(f'{record["file"]} | {record.get("timestamp") or "Không rõ thời gian"} | GPS {point[0]}, {point[1]} | Nguồn: {source}')
-        folium.Marker(point, tooltip=text, popup=folium.Popup(text, max_width=450)).add_to(result)
+    colors = {'CSV': 'blue', 'EXIF': 'green', 'reference': 'gray'}
+    layers = {name: folium.FeatureGroup(name='GPS ' + name).add_to(result) for name in colors}
+    for record in records:
+        for source, gps in gps_sources(record).items():
+            if gps['status'] != 'valid':
+                continue
+            point = [gps['latitude'], gps['longitude']]
+            points.append(point)
+            label = 'Tham chiếu / chưa xác định nguồn' if source == 'reference' else source
+            text = escape(f'{record.get("file", "")} | {record.get("timestamp") or "Không rõ thời gian"} | GPS {point[0]}, {point[1]} | Nguồn: {label}')
+            folium.Marker(point, tooltip=text, popup=folium.Popup(text, max_width=450),
+                          icon=folium.Icon(color=colors[source])).add_to(layers[source])
+    folium.LayerControl(collapsed=False).add_to(result)
     if len(points) == 1:
         result.location = points[0]
     elif points:
@@ -23,5 +29,5 @@ def create_map(records):
 
 
 def export_map(records, output):
-    """Dùng cùng một bản đồ cho giao diện và xuất HTML."""
+    """Lưu cùng bản đồ được dùng trong giao diện."""
     create_map(records).save(str(output))
