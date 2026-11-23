@@ -2,7 +2,7 @@
 
 **Demo phân tích ảnh số và kiểm tra tính nhất quán của metadata GPS bằng Python.**
 
-GeoImageForensics là ứng dụng desktop phục vụ đề tài **Nghiên cứu kỹ thuật Image Forensics và xây dựng chương trình bằng Python hỗ trợ phân tích ảnh số**. Chương trình được xây dựng theo hướng dễ đọc, dễ sử dụng và phù hợp để trình diễn trong đồ án ngành An toàn thông tin.
+GeoImageForensics phục vụ đề tài **Nghiên cứu kỹ thuật Image Forensics và xây dựng chương trình bằng Python hỗ trợ phân tích ảnh số**.
 
 Ứng dụng kết hợp thông tin từ ảnh, EXIF và metadata CSV để hỗ trợ người dùng quan sát dữ liệu, phát hiện dấu hiệu cần kiểm tra và xuất kết quả phân tích. 
 ## Mục tiêu demo
